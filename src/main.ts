@@ -114,11 +114,13 @@ class Rpc {
 
   private dispatch(message: RpcMessage): void {
     if (message.id !== undefined && message.method === undefined) {
-      const waiter = typeof message.id === "number" ? this.pending.get(message.id) : undefined;
-      if (waiter) {
-        this.pending.delete(message.id);
-        if (message.error) waiter.reject(new Error(message.error.message));
-        else waiter.resolve((message.result ?? null) as Json);
+      if (typeof message.id === "number") {
+        const waiter = this.pending.get(message.id);
+        if (waiter) {
+          this.pending.delete(message.id);
+          if (message.error) waiter.reject(new Error(message.error.message));
+          else waiter.resolve((message.result ?? null) as Json);
+        }
       }
       return;
     }
@@ -235,6 +237,7 @@ type ChunkSink = (chunk: JsonObject) => Promise<void>;
 interface TurnResult {
   stopReason: string;
   tokens?: { input: number; output: number; total?: number };
+  structuredOutput?: Json;
 }
 
 async function newOmpSession(child: OmpChild, cwd: string): Promise<string> {
@@ -266,6 +269,40 @@ function extractToolOutput(update: JsonObject): string | undefined {
     }
   }
   return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+// Best-effort structured output repair: a model told to answer with one schema
+// object sometimes appends a second JSON blob or wraps it in prose. The engine
+// prefers a provider structuredOutput payload over parsing the text, so the
+// bridge extracts the first balanced JSON value itself.
+function extractFirstJson(text: string): Json | undefined {
+  const start = text.search(/[{[]/);
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1)) as Json;
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -334,6 +371,7 @@ async function runOmpTurn(
   // Block coalescing: Archon wants whole text blocks; omp streams deltas tagged
   // per messageId. Flush on id change, tool boundary, or turn end.
   let messageText = "";
+  let turnText = "";
   let messageId = "";
   let thoughtText = "";
   let thoughtId = "";
@@ -360,7 +398,10 @@ async function runOmpTurn(
         if (currentMessageId !== messageId) await flushMessage();
         messageId = currentMessageId;
         const content = (update.content ?? {}) as JsonObject;
-        if (typeof content.text === "string") messageText += content.text;
+        if (typeof content.text === "string") {
+          messageText += content.text;
+          turnText += content.text;
+        }
         return;
       }
       if (kind === "agent_thought_chunk") {
@@ -441,7 +482,9 @@ async function runOmpTurn(
       if (typeof u.totalTokens === "number") tokens.total = u.totalTokens;
     }
   }
-  return { stopReason, tokens };
+  const structuredOutput =
+    request.outputFormat !== undefined ? extractFirstJson(turnText) : undefined;
+  return { stopReason, tokens, ...(structuredOutput !== undefined ? { structuredOutput } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +573,9 @@ async function main(): Promise<void> {
             sessionId: session.ompSessionId,
             stopReason,
             ...(turn.tokens !== undefined ? { tokens: turn.tokens } : {}),
+            ...(turn.structuredOutput !== undefined
+              ? { structuredOutput: turn.structuredOutput }
+              : {}),
           },
         });
         await host.notify("_archon/chunk", { sessionId, chunk: { type: "settled" } });
@@ -549,7 +595,7 @@ async function main(): Promise<void> {
       void session.child.rpc.notify("session/cancel", { sessionId: session.ompSessionId });
   });
 
-  host.onRequest("_archon/check_credential", async () => {
+  host.onRequest("_archon/check_credential", async (): Promise<Json> => {
     try {
       const probe = Bun.spawn(["omp", "--version"], { stdout: "pipe", stderr: "pipe" });
       const code = await probe.exited;
@@ -573,7 +619,7 @@ async function main(): Promise<void> {
         for (const raw of text.split("\n")) {
           const providerMatch = /^  ([a-zA-Z0-9_-]+):\s*$/.exec(raw);
           if (providerMatch !== null) {
-            provider = providerMatch[1];
+            provider = providerMatch[1] ?? "";
             continue;
           }
           const idMatch = /^\s*-\s+id:\s*(\S+)/.exec(raw);
