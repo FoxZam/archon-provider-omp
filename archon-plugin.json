@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "name": "archon-provider-omp",
+  "description": "Archon provider plugin that drives the oh-my-pi (omp) coding agent over the Agent Client Protocol.",
+  "kind": "provider",
+  "executable": "archon-provider-omp",
+  "compatibility": { "archon": ">=0.11.1" }
+}

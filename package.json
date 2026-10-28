@@ -1,0 +1,13 @@
+{
+  "name": "archon-provider-omp",
+  "version": "0.1.0",
+  "description": "Archon provider plugin driving the oh-my-pi (omp) coding agent over ACP",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "build": "bun run build.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5"
+  }
+}
