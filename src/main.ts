@@ -271,18 +271,35 @@ function extractToolOutput(update: JsonObject): string | undefined {
   return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
-// Best-effort structured output repair: a model told to answer with one schema
-// object sometimes appends a second JSON blob or wraps it in prose. The engine
-// prefers a provider structuredOutput payload over parsing the text, so the
-// bridge extracts the first balanced JSON value itself.
+// Best-effort structured output repair, mirroring the engine's canonical tiers
+// (trim, strip code fences, whole-text parse, forward scan from the first `{`).
+// A model told to answer with one schema object sometimes appends a second JSON
+// blob or wraps it in prose; the engine prefers a provider structuredOutput
+// payload over parsing the text. Objects only: a schema node's payload is an
+// object, and extracting an array or stray value would burn a reask.
 function extractFirstJson(text: string): Json | undefined {
-  const start = text.search(/[{[]/);
+  const asObject = (candidate: string): Json | undefined => {
+    try {
+      const parsed = JSON.parse(candidate) as Json;
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  let body = text.trim();
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(body);
+  if (fenced !== null) body = fenced[1]!.trim();
+  const whole = asObject(body);
+  if (whole !== undefined) return whole;
+  const start = body.indexOf("{");
   if (start < 0) return undefined;
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let i = start; i < text.length; i += 1) {
-    const ch = text[i];
+  for (let i = start; i < body.length; i += 1) {
+    const ch = body[i];
     if (inString) {
       if (escaped) escaped = false;
       else if (ch === "\\") escaped = true;
@@ -290,15 +307,15 @@ function extractFirstJson(text: string): Json | undefined {
       continue;
     }
     if (ch === '"') inString = true;
-    else if (ch === "{" || ch === "[") depth += 1;
-    else if (ch === "}" || ch === "]") {
+    else if (ch === "{") depth += 1;
+    else if (ch === "}") {
       depth -= 1;
       if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(start, i + 1)) as Json;
-        } catch {
-          return undefined;
-        }
+        const found = asObject(body.slice(start, i + 1));
+        if (found !== undefined) return found;
+        const next = body.slice(i + 1).indexOf("{");
+        if (next < 0) return undefined;
+        return extractFirstJson(body.slice(i + 1 + next));
       }
     }
   }
