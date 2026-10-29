@@ -28,6 +28,15 @@ Model strings pass through verbatim: set tiers to omp ids such as
 `lemonade/gufo.Qwen3.8-Flash-Next-UD-Q4_K_XL` (optionally with an `:effort`
 suffix, which omp's `--model` flag understands).
 
+Inline `agents:` on a workflow node are supported: before each turn the
+provider writes the node's agent definitions into `<cwd>/.omp/agents/*.md`
+(omp's project agent directory, so the session's `task` tool can spawn them)
+and restores the directory when the turn ends. `description` and `prompt` map
+directly; `model` passes through to omp's fuzzy matcher and `tools` are
+translated from Claude SDK names to omp names (unmapped names pass through
+lowercased); `disallowedTools`, `skills` and `maxTurns` have no omp equivalent
+and are ignored.
+
 ## Install
 
 ```bash

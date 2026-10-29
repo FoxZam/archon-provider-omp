@@ -14,6 +14,8 @@
  * stdout carries RPC frames only; everything else goes to stderr.
  */
 
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 type JsonObject = { [key: string]: Json };
 
@@ -157,7 +159,7 @@ const DESCRIPTOR = {
   protocol: 1,
   id: "omp",
   displayName: "oh my pi",
-  version: "0.1.0",
+  version: "0.2.0",
   capabilities: {
     backgroundWork: "unobserved",
     sessionResume: true,
@@ -165,7 +167,7 @@ const DESCRIPTOR = {
     hooks: false,
     skills: false,
     plugins: false,
-    agents: false,
+    agents: true,
     toolRestrictions: false,
     structuredOutput: "best-effort",
     requiresAllPropertiesRequired: false,
@@ -185,6 +187,14 @@ const DESCRIPTOR = {
   configSchema: { type: "object" },
 } as const satisfies JsonObject;
 
+/** One Archon inline sub-agent definition (`nodeConfig.agents`, Claude SDK shape). */
+interface AgentDefinition {
+  description: string;
+  prompt: string;
+  model?: string;
+  tools?: string[];
+}
+
 interface SessionRequest {
   prompt: string;
   cwd: string;
@@ -196,6 +206,7 @@ interface SessionRequest {
   maxBudgetUsd?: number;
   forkSession?: boolean;
   env?: Record<string, string>;
+  nodeConfig?: { agents?: Record<string, AgentDefinition> };
 }
 
 // ---------------------------------------------------------------------------
@@ -207,10 +218,15 @@ interface OmpChild {
   kill(): void;
 }
 
-function spawnOmp(model: string | undefined, extraEnv: Record<string, string>): OmpChild {
+function spawnOmp(
+  model: string | undefined,
+  cwd: string,
+  extraEnv: Record<string, string>
+): OmpChild {
   const args = ["acp", "--approval-mode", "yolo"];
   if (model !== undefined && model.length > 0) args.push("--model", model);
   const child = Bun.spawn(["omp", ...args], {
+    cwd,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "inherit",
@@ -230,6 +246,89 @@ function spawnOmp(model: string | undefined, extraEnv: Record<string, string>): 
       }
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Inline node agents (Archon `agents:` → omp project agent files)
+// ---------------------------------------------------------------------------
+
+/** Claude SDK tool names → omp tool names; unmapped names pass through lowercased. */
+const OMP_TOOL_NAMES: Record<string, string> = {
+  read: "read",
+  write: "write",
+  edit: "edit",
+  multiedit: "edit",
+  bash: "bash",
+  grep: "grep",
+  glob: "glob",
+  websearch: "web_search",
+  webfetch: "web_fetch",
+  task: "task",
+  agent: "task",
+};
+
+function agentMarkdown(id: string, agent: AgentDefinition): string {
+  const front: string[] = [
+    "---",
+    `name: ${JSON.stringify(id)}`,
+    `description: ${JSON.stringify(agent.description)}`,
+  ];
+  if (agent.tools !== undefined && agent.tools.length > 0)
+    front.push(
+      `tools: [${agent.tools
+        .map(t => OMP_TOOL_NAMES[t.toLowerCase()] ?? t.toLowerCase())
+        .map(t => JSON.stringify(t))
+        .join(", ")}]`
+    );
+  if (agent.model !== undefined && agent.model.length > 0)
+    front.push(`model: ${JSON.stringify(agent.model)}`);
+  front.push("---", "", agent.prompt.trim(), "");
+  return front.join("\n");
+}
+
+/**
+ * Write the node's inline agents into `<cwd>/.omp/agents` (omp's project agent
+ * directory, discovered by the task tool) for the duration of one turn, and
+ * return a cleanup restoring the directory: overwritten files are put back,
+ * created files and directories are removed.
+ */
+async function materializeNodeAgents(
+  cwd: string,
+  agents: Record<string, AgentDefinition> | undefined
+): Promise<() => Promise<void>> {
+  if (agents === undefined || Object.keys(agents).length === 0) return async () => {};
+  const ompDir = `${cwd}/.omp`;
+  const agentsDir = `${ompDir}/agents`;
+  const dirExisted = await stat(agentsDir).then(
+    () => true,
+    () => false
+  );
+  const ompExisted = await stat(ompDir).then(
+    () => true,
+    () => false
+  );
+  const written: { path: string; previous: string | null }[] = [];
+  const undo = async (): Promise<void> => {
+    for (const { path, previous } of written) {
+      if (previous !== null) await writeFile(path, previous);
+      else await rm(path, { force: true });
+    }
+    if (!dirExisted) await rm(agentsDir, { recursive: true }).catch(() => {});
+    if (!ompExisted) await rm(ompDir, { recursive: true }).catch(() => {});
+  };
+  try {
+    if (!dirExisted) await mkdir(agentsDir, { recursive: true });
+    for (const [id, agent] of Object.entries(agents)) {
+      const path = `${agentsDir}/${id.replace(/[^a-zA-Z0-9._-]/g, "-")}.md`;
+      const previous = await readFile(path, "utf8").catch(() => null);
+      await writeFile(path, agentMarkdown(id, agent));
+      written.push({ path, previous });
+    }
+  } catch (error) {
+    await undo();
+    throw new Error(`cannot materialize node agents: ${String(error)}`);
+  }
+  return undo;
 }
 
 type ChunkSink = (chunk: JsonObject) => Promise<void>;
@@ -571,7 +670,11 @@ async function main(): Promise<void> {
     const text = first !== null && typeof first === "object" ? (first as JsonObject).text : undefined;
     if (text !== session.request.prompt) throw new Error("session/prompt disagrees with request");
 
-    const child = spawnOmp(session.request.model, session.request.env ?? {});
+    const cleanupAgents = await materializeNodeAgents(
+      session.request.cwd,
+      session.request.nodeConfig?.agents
+    );
+    const child = spawnOmp(session.request.model, session.request.cwd, session.request.env ?? {});
     session.child = child;
     const sink: ChunkSink = async chunk => {
       if (!cancelled) await host.notify("_archon/chunk", { sessionId, chunk });
@@ -600,6 +703,7 @@ async function main(): Promise<void> {
       return { stopReason };
     } finally {
       child.kill();
+      await cleanupAgents();
       sessions.delete(sessionId);
     }
   });
